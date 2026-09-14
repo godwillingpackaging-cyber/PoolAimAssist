@@ -17,7 +17,7 @@ class OverlayView(context: Context) : View(context) {
     @Volatile
     var guides: List<ShotGuide> = emptyList()
     @Volatile
-    var pockets: List<Pt> = emptyList()
+    var pocketPoints: List<Pt> = emptyList()
 
     private val bestLinePaint = Paint().apply {
         color = Color.YELLOW
@@ -47,7 +47,7 @@ class OverlayView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        for (p in pockets) {
+        for (p in pocketPoints) {
             canvas.drawCircle(p.x, p.y, 22f, pocketPaint)
         }
 
@@ -73,7 +73,7 @@ class OverlayView(context: Context) : View(context) {
     }
 
     fun setPockets(newPockets: List<Pt>) {
-        pockets = newPockets
+        pocketPoints = newPockets
         postInvalidate()
     }
 }
