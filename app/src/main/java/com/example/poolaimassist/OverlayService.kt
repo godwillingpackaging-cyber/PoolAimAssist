@@ -10,6 +10,8 @@ import android.graphics.PixelFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.IBinder
 import android.view.Gravity
 import android.view.WindowManager
@@ -54,6 +56,14 @@ class OverlayService : Service() {
 
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
+
+        // Required since Android 14: a callback must be registered before createVirtualDisplay()
+        // is called, or the system throws a SecurityException.
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                stopSelf()
+            }
+        }, Handler(Looper.getMainLooper()))
 
         addOverlayWindow()
         addControlPanel()
