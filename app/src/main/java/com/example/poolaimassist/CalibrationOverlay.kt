@@ -7,64 +7,32 @@ import android.graphics.Paint
 import android.view.MotionEvent
 import android.view.View
 
-/**
- * A touchable, full-screen, semi-transparent overlay used ONLY during calibration.
- * Drawn on top of the live game (which stays fully visible underneath) so the user can
- * tap each pocket exactly where it appears on their table skin.
- *
- * This view is added/removed from the WindowManager by OverlayService; it is NOT part of
- * the always-on guide overlay (which is non-touchable so it never blocks game input).
- */
-class CalibrationOverlay(
-    context: Context,
-    private val onComplete: (List<Pt>) -> Unit
-) : View(context) {
-
+/** Same local coordinate space as OverlayView; no raw screen-offset drift. */
+class CalibrationOverlay(context: Context, private val onComplete: (List<Pt>) -> Unit) : View(context) {
     private val labels = listOf(
-        "1/6: Tap TOP-LEFT pocket",
-        "2/6: Tap TOP-MIDDLE pocket",
-        "3/6: Tap TOP-RIGHT pocket",
-        "4/6: Tap BOTTOM-RIGHT pocket",
-        "5/6: Tap BOTTOM-MIDDLE pocket",
-        "6/6: Tap BOTTOM-LEFT pocket"
+        "1/6: TOP LEFT pocket", "2/6: TOP MIDDLE pocket", "3/6: TOP RIGHT pocket",
+        "4/6: BOTTOM RIGHT pocket", "5/6: BOTTOM MIDDLE pocket", "6/6: BOTTOM LEFT pocket"
     )
     private val tapped = mutableListOf<Pt>()
-
-    private val dimPaint = Paint().apply { color = Color.argb(60, 0, 0, 0) }
-    private val markerPaint = Paint().apply {
-        color = Color.CYAN
-        style = Paint.Style.FILL
-        isAntiAlias = true
-    }
-    private val textPaint = Paint().apply {
-        color = Color.WHITE
-        textSize = 42f
-        isAntiAlias = true
-    }
-    private val textBgPaint = Paint().apply { color = Color.argb(180, 0, 0, 0) }
-
+    private val dim = Paint().apply { color = Color.argb(45, 0, 0, 0) }
+    private val marker = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.CYAN; style = Paint.Style.STROKE; strokeWidth = 5f }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 33f }
+    private val background = Paint().apply { color = Color.argb(220, 0, 0, 0) }
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), dimPaint)
-
-        for (p in tapped) {
-            canvas.drawCircle(p.x, p.y, 16f, markerPaint)
-        }
-
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), dim)
+        tapped.forEach { canvas.drawCircle(it.x, it.y, 17f, marker) }
         val label = if (tapped.size < labels.size) labels[tapped.size] else "Saved!"
-        canvas.drawRect(24f, 60f, 24f + textPaint.measureText(label) + 32f, 60f + 70f, textBgPaint)
-        canvas.drawText(label, 40f, 110f, textPaint)
+        val labelWidth = textPaint.measureText(label)
+        canvas.drawRoundRect(16f, height - 83f, labelWidth + 48f, height - 12f, 16f, 16f, background)
+        canvas.drawText(label, 32f, height - 34f, textPaint)
     }
-
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_DOWN) {
-            if (tapped.size < labels.size) {
-                tapped.add(Pt(event.rawX, event.rawY))
-                invalidate()
-                if (tapped.size == labels.size) {
-                    postDelayed({ onComplete(tapped.toList()) }, 300)
-                }
-            }
+        if (event.actionMasked == MotionEvent.ACTION_DOWN && tapped.size < 6) {
+            // Both calibration and guide overlays are fullscreen window-local views.
+            tapped.add(Pt(event.x, event.y))
+            invalidate()
+            if (tapped.size == 6) postDelayed({ onComplete(tapped.toList()) }, 250)
         }
         return true
     }

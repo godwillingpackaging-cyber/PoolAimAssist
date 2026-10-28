@@ -7,13 +7,9 @@ import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
-import kotlin.math.abs
+import android.widget.TextView
 
-/**
- * Small, draggable floating control bar (Recalibrate / Stop) that sits on top of the game
- * alongside the guide lines. This is the only always-touchable piece of UI; the guide
- * overlay itself stays FLAG_NOT_TOUCHABLE so it never blocks game input.
- */
+/** A dedicated MOVE handle avoids button touch events swallowing the drag gesture. */
 class ControlPanelView(
     context: Context,
     private val windowManager: WindowManager,
@@ -21,50 +17,35 @@ class ControlPanelView(
     private val onCalibrate: () -> Unit,
     private val onStop: () -> Unit
 ) : LinearLayout(context) {
-
-    private var downX = 0f
-    private var downY = 0f
-    private var startWx = 0
-    private var startWy = 0
-    private var isDrag = false
-
     init {
         orientation = HORIZONTAL
-        setBackgroundColor(Color.argb(200, 20, 20, 20))
-        setPadding(16, 12, 16, 12)
-
-        val calibrateBtn = Button(context).apply {
-            text = "Calibrate"
-            setOnClickListener { onCalibrate() }
+        gravity = Gravity.CENTER_VERTICAL
+        setBackgroundColor(Color.argb(220, 20, 20, 20))
+        setPadding(6, 5, 6, 5)
+        val handle = TextView(context).apply {
+            text = "≡ MOVE"
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setPadding(12, 20, 12, 20)
         }
-        val stopBtn = Button(context).apply {
-            text = "Stop"
-            setOnClickListener { onStop() }
-        }
-        addView(calibrateBtn)
-        addView(stopBtn)
-
-        setOnTouchListener { _, event ->
-            when (event.action) {
+        addView(handle)
+        addView(Button(context).apply { text = "Calibrate"; setOnClickListener { onCalibrate() } })
+        addView(Button(context).apply { text = "Stop"; setOnClickListener { onStop() } })
+        var downX = 0f; var downY = 0f; var startX = 0; var startY = 0
+        handle.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX
-                    downY = event.rawY
-                    startWx = layoutParams.x
-                    startWy = layoutParams.y
-                    isDrag = false
-                    false // let the click also propagate to the buttons
+                    downX = event.rawX; downY = event.rawY
+                    startX = layoutParams.x; startY = layoutParams.y
+                    true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - downX
-                    val dy = event.rawY - downY
-                    if (abs(dx) > 12 || abs(dy) > 12) {
-                        isDrag = true
-                        layoutParams.x = startWx + dx.toInt()
-                        layoutParams.y = startWy + dy.toInt()
-                        windowManager.updateViewLayout(this, layoutParams)
-                    }
-                    isDrag
+                    layoutParams.x = (startX + (event.rawX - downX).toInt()).coerceAtLeast(0)
+                    layoutParams.y = (startY + (event.rawY - downY).toInt()).coerceAtLeast(0)
+                    windowManager.updateViewLayout(this, layoutParams)
+                    true
                 }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
                 else -> false
             }
         }

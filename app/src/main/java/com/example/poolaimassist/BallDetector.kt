@@ -4,146 +4,167 @@ import android.graphics.Bitmap
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sqrt
 
 /**
- * Lightweight, dependency-free ball detector.
- *
- * Strategy (works reasonably well for the flat, evenly-lit look of a pool table screenshot,
- * without needing OpenCV / TensorFlow / any native CV library):
- *
- *  1. Downsample the captured frame to a coarse grid (keeps this fast enough to run several
- *     times per second in pure Kotlin on the CPU).
- *  2. Estimate the "table color" as the most common color among the sampled grid cells
- *     (the felt dominates the frame).
- *  3. Mark every grid cell whose color differs enough from the table color as "foreground".
- *  4. Group foreground cells into blobs with a flood fill (4-connected).
- *  5. Keep blobs whose bounding box is roughly square and within a plausible ball-size range
- *     -> those are candidate balls. Their average color classifies cue ball (near-white) vs
- *     object balls.
- *
- * This is intentionally simple and tunable (see the constants below) rather than a full
- * production CV pipeline -- swap this class out for an OpenCV/ML-based implementation later
- * if you want more robust detection across different table skins.
+ * Table-aware detector for the blue-felt layout used in 8 Ball Pool.
+ * Works only inside the six calibrated pockets and suppresses long thin cue guides.
+ * This is a best-effort image classifier, not an ML model.
  */
-class BallDetector(
-    private val gridStep: Int = 6,              // sample every Nth pixel (perf knob)
-    private val colorDiffThreshold: Int = 42,    // how different from table color = "foreground"
-    private val minBlobDiameterPx: Int = 10,     // ignore tiny noise blobs
-    private val maxBlobDiameterFraction: Float = 0.12f // ignore blobs bigger than X% of frame width (not a ball)
-) {
-
-    fun detectBalls(bitmap: Bitmap): List<Ball> {
+class BallDetector(private val gridStep: Int = 3) {
+    fun detectBalls(bitmap: Bitmap, pockets: List<Pt> = emptyList()): List<Ball> {
         val w = bitmap.width
         val h = bitmap.height
-        val cols = w / gridStep
-        val rows = h / gridStep
-        if (cols < 4 || rows < 4) return emptyList()
+        if (pockets.size != 6 || w < 100 || h < 100) return emptyList()
+        val minPocketX = pockets.minOf { it.x }
+        val maxPocketX = pockets.maxOf { it.x }
+        val minPocketY = pockets.minOf { it.y }
+        val maxPocketY = pockets.maxOf { it.y }
+        val tableW = maxPocketX - minPocketX
+        val tableH = maxPocketY - minPocketY
+        if (tableW < 160f || tableH < 80f) return emptyList()
 
-        // Sample a coarse grid of colors once.
-        val grid = IntArray(cols * rows)
-        for (r in 0 until rows) {
-            for (c in 0 until cols) {
-                grid[r * cols + c] = bitmap.getPixel(c * gridStep, r * gridStep)
-            }
+        // Exclude cushion, pocket markers and top/bottom HUD.
+        val inset = max(10f, min(tableW, tableH) * 0.045f)
+        val x0 = (minPocketX + inset).toInt().coerceIn(0, w - 1)
+        val x1 = (maxPocketX - inset).toInt().coerceIn(1, w)
+        val y0 = (minPocketY + inset).toInt().coerceIn(0, h - 1)
+        val y1 = (maxPocketY - inset).toInt().coerceIn(1, h)
+        val cols = (x1 - x0) / gridStep
+        val rows = (y1 - y0) / gridStep
+        if (cols < 10 || rows < 10) return emptyList()
+
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        fun pixel(x: Int, y: Int): Int = pixels[y * w + x]
+
+        // Get a robust felt colour from spaced positions away from the rails.
+        val rs = mutableListOf<Int>()
+        val gs = mutableListOf<Int>()
+        val bs = mutableListOf<Int>()
+        for (gy in 1..5) for (gx in 1..7) {
+            val sx = x0 + ((x1 - x0) * gx / 8)
+            val sy = y0 + ((y1 - y0) * gy / 6)
+            val c = pixel(sx, sy)
+            rs.add(c shr 16 and 255)
+            gs.add(c shr 8 and 255)
+            bs.add(c and 255)
+        }
+        val feltR = rs.sorted()[rs.size / 2]
+        val feltG = gs.sorted()[gs.size / 2]
+        val feltB = bs.sorted()[bs.size / 2]
+        val feltGR = feltG - feltR
+        val feltBG = feltB - feltG
+
+        fun isFelt(c: Int): Boolean {
+            val r = c shr 16 and 255
+            val g = c shr 8 and 255
+            val b = c and 255
+            val gr = g - r
+            val bg = b - g
+            // Relative channel differences survive the table's light/dark gradient.
+            return abs(gr - feltGR) < 48 && abs(bg - feltBG) < 45 &&
+                (if (feltGR >= 15) gr >= 20 else true) &&
+                (if (feltBG >= 6) bg >= 4 else if (feltBG <= -6) bg <= -4 else true)
         }
 
-        val tableColor = estimateDominantColor(grid)
+        val mask = BooleanArray(cols * rows)
+        for (y in 0 until rows) for (x in 0 until cols) {
+            mask[y * cols + x] = !isFelt(pixel(x0 + x * gridStep, y0 + y * gridStep))
+        }
+        // Opening: 3x3 erosion then dilation suppresses narrow white aiming lines.
+        val eroded = BooleanArray(mask.size)
+        for (y in 1 until rows - 1) for (x in 1 until cols - 1) {
+            var all = true
+            for (dy in -1..1) for (dx in -1..1) {
+                if (!mask[(y + dy) * cols + x + dx]) all = false
+            }
+            eroded[y * cols + x] = all
+        }
+        val opened = BooleanArray(mask.size)
+        for (y in 1 until rows - 1) for (x in 1 until cols - 1) {
+            var any = false
+            for (dy in -1..1) for (dx in -1..1) {
+                if (eroded[(y + dy) * cols + x + dx]) any = true
+            }
+            opened[y * cols + x] = any
+        }
 
-        val visited = BooleanArray(cols * rows)
-        val balls = mutableListOf<Ball>()
-        val maxBlobDiameterPx = w * maxBlobDiameterFraction
-
-        for (r in 0 until rows) {
-            for (c in 0 until cols) {
-                val idx = r * cols + c
-                if (visited[idx]) continue
-                val color = grid[idx]
-                if (!isForeground(color, tableColor)) {
-                    visited[idx] = true
-                    continue
-                }
-                // Flood fill this blob.
-                val stack = ArrayDeque<Int>()
-                stack.addLast(idx)
-                visited[idx] = true
-                var minC = c; var maxC = c; var minR = r; var maxR = r
-                var sumR = 0L; var sumG = 0L; var sumB = 0L; var count = 0L
-
-                while (stack.isNotEmpty()) {
-                    val cur = stack.removeLast()
-                    val cr = cur / cols
-                    val cc = cur % cols
-                    val curColor = grid[cur]
-                    sumR += (curColor shr 16) and 0xFF
-                    sumG += (curColor shr 8) and 0xFF
-                    sumB += curColor and 0xFF
-                    count++
-                    minC = min(minC, cc); maxC = max(maxC, cc)
-                    minR = min(minR, cr); maxR = max(maxR, cr)
-
-                    val neighbors = intArrayOf(cur - 1, cur + 1, cur - cols, cur + cols)
-                    for (n in neighbors) {
-                        if (n < 0 || n >= grid.size) continue
-                        // avoid wrap-around on row boundaries
-                        val nr = n / cols
-                        if (abs(nr - cr) > 1) continue
-                        if (visited[n]) continue
-                        if (isForeground(grid[n], tableColor)) {
-                            visited[n] = true
-                            stack.addLast(n)
-                        } else {
-                            visited[n] = true
-                        }
+        val visited = BooleanArray(opened.size)
+        val objects = mutableListOf<Pair<Ball, Float>>()
+        val minDiameter = max(10f, tableW * 0.010f)
+        val maxDiameter = max(26f, tableW * 0.060f)
+        val stack = IntArray(opened.size)
+        for (root in opened.indices) {
+            if (!opened[root] || visited[root]) continue
+            var count = 0
+            var top = 0
+            stack[top++] = root
+            visited[root] = true
+            var minX = cols; var maxX = 0; var minY = rows; var maxY = 0
+            while (top > 0) {
+                val current = stack[--top]
+                val cx = current % cols
+                val cy = current / cols
+                count++
+                minX = min(minX, cx); maxX = max(maxX, cx)
+                minY = min(minY, cy); maxY = max(maxY, cy)
+                for (dy in -1..1) for (dx in -1..1) {
+                    val nx = cx + dx; val ny = cy + dy
+                    if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue
+                    val next = ny * cols + nx
+                    if (opened[next] && !visited[next]) {
+                        visited[next] = true
+                        stack[top++] = next
                     }
                 }
-
-                val blobWpx = (maxC - minC + 1) * gridStep
-                val blobHpx = (maxR - minR + 1) * gridStep
-                val diameter = max(blobWpx, blobHpx).toFloat()
-                val aspect = blobWpx.toFloat() / blobHpx.toFloat()
-
-                val looksRound = aspect in 0.6f..1.6f
-                val plausibleSize = diameter in minBlobDiameterPx.toFloat()..maxBlobDiameterPx
-
-                if (looksRound && plausibleSize && count > 0) {
-                    val avgR = (sumR / count).toInt()
-                    val avgG = (sumG / count).toInt()
-                    val avgB = (sumB / count).toInt()
-                    val centerX = (minC + maxC) / 2f * gridStep + gridStep / 2f
-                    val centerY = (minR + maxR) / 2f * gridStep + gridStep / 2f
-                    val isCue = isNearWhite(avgR, avgG, avgB)
-                    balls.add(Ball(Pt(centerX, centerY), diameter / 2f, isCue))
-                }
             }
+            val pw = (maxX - minX + 1) * gridStep.toFloat()
+            val ph = (maxY - minY + 1) * gridStep.toFloat()
+            val diameter = max(pw, ph)
+            val aspect = pw / max(1f, ph)
+            if (count < 7 || diameter !in minDiameter..maxDiameter || aspect !in 0.60f..1.65f) continue
+            val bx = x0 + (minX + maxX + 1) * gridStep / 2f
+            val by = y0 + (minY + maxY + 1) * gridStep / 2f
+            val radius = diameter * 0.50f
+
+            // White cue ball = large neutral-white area and almost no saturated colour.
+            var white = 0
+            var saturated = 0
+            var total = 0
+            val inner = max(4, (radius * 0.75f).toInt())
+            val cx = bx.toInt(); val cy = by.toInt()
+            for (dy in -inner..inner step 2) for (dx in -inner..inner step 2) {
+                if (dx * dx + dy * dy > inner * inner) continue
+                val xx = cx + dx; val yy = cy + dy
+                if (xx !in 0 until w || yy !in 0 until h) continue
+                val c = pixel(xx, yy)
+                val r = c shr 16 and 255
+                val g = c shr 8 and 255
+                val b = c and 255
+                val high = max(r, max(g, b))
+                val low = min(r, min(g, b))
+                if (low > 175 && high - low < 55) white++
+                if (high - low > 90) saturated++
+                total++
+            }
+            if (total == 0) continue
+            val whiteness = white.toFloat() / total
+            val strongColor = saturated.toFloat() / total
+            val cueScore = whiteness - 0.8f * strongColor
+            objects.add(Pair(Ball(Pt(bx, by), radius, false), cueScore))
         }
-
-        return balls
-    }
-
-    private fun isForeground(color: Int, tableColor: Int): Boolean {
-        val dr = ((color shr 16) and 0xFF) - ((tableColor shr 16) and 0xFF)
-        val dg = ((color shr 8) and 0xFF) - ((tableColor shr 8) and 0xFF)
-        val db = (color and 0xFF) - (tableColor and 0xFF)
-        val dist = sqrt((dr * dr + dg * dg + db * db).toDouble())
-        return dist > colorDiffThreshold
-    }
-
-    private fun isNearWhite(r: Int, g: Int, b: Int): Boolean {
-        return r > 190 && g > 190 && b > 190
-    }
-
-    /** Most common color in the sampled grid, bucketed to reduce noise from anti-aliasing/lighting. */
-    private fun estimateDominantColor(grid: IntArray): Int {
-        val buckets = HashMap<Int, Int>()
-        val bucketSize = 16
-        for (color in grid) {
-            val r = ((color shr 16) and 0xFF) / bucketSize * bucketSize
-            val g = ((color shr 8) and 0xFF) / bucketSize * bucketSize
-            val b = (color and 0xFF) / bucketSize * bucketSize
-            val key = (r shl 16) or (g shl 8) or b
-            buckets[key] = (buckets[key] ?: 0) + 1
+        if (objects.isEmpty()) return emptyList()
+        // Most game balls share a radius. Reject tiny prohibition icons and merged blobs.
+        val radii = objects.map { it.first.radiusPx }.sorted()
+        val medianRadius = radii[radii.size / 2]
+        val consistent = objects.filter {
+            it.first.radiusPx >= medianRadius * 0.85f && it.first.radiusPx <= medianRadius * 1.4f
         }
-        return buckets.maxByOrNull { it.value }?.key ?: 0x228B22 // fallback: felt green
+        if (consistent.isEmpty()) return emptyList()
+        val best = consistent.indices.maxByOrNull { consistent[it].second } ?: return emptyList()
+        val cueIndex = if (consistent[best].second >= 0.38f) best else -1
+        return consistent.mapIndexed { index, pair ->
+            pair.first.copy(isCueBall = index == cueIndex)
+        }
     }
 }
