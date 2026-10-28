@@ -1,11 +1,13 @@
 package com.example.poolaimassist
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -13,203 +15,160 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.IBinder
+import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 
-/**
- * Foreground service that owns the MediaProjection session, runs the capture ->
- * detect -> compute-guides -> draw loop, and hosts the overlay window.
- *
- * Started with the MediaProjection permission result Intent + resultCode from MainActivity.
- */
 class OverlayService : Service() {
-
     companion object {
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
         private const val CHANNEL_ID = "pool_aim_assist_channel"
         private const val NOTIFICATION_ID = 1
     }
-
-    private var mediaProjection: MediaProjection? = null
-    private var captureEngine: CaptureEngine? = null
-    private var overlayView: OverlayView? = null
-    private var controlPanel: ControlPanelView? = null
-    private var calibrationOverlay: CalibrationOverlay? = null
-    private var windowManager: WindowManager? = null
+    private var projection: MediaProjection? = null
+    private var engine: CaptureEngine? = null
+    private var overlay: OverlayView? = null
+    private var panel: ControlPanelView? = null
+    private var calibration: CalibrationOverlay? = null
+    private var wm: WindowManager? = null
     private val detector = BallDetector()
     private var calibrating = false
+    private var frameCount = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification())
-
-        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
+        startForeground(NOTIFICATION_ID, notification())
+        val code = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
+        @Suppress("DEPRECATION")
         val resultData: Intent? = intent?.getParcelableExtra(EXTRA_RESULT_DATA)
-
-        if (resultCode != android.app.Activity.RESULT_OK || resultData == null) {
-            stopSelf()
-            return START_NOT_STICKY
+        if (code != Activity.RESULT_OK || resultData == null) {
+            stopSelf(); return START_NOT_STICKY
         }
-
-        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
-
-        // Required since Android 14: a callback must be registered before createVirtualDisplay()
-        // is called, or the system throws a SecurityException.
-        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                stopSelf()
-            }
+        val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        projection = pm.getMediaProjection(code, resultData)
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }
         }, Handler(Looper.getMainLooper()))
-
-        addOverlayWindow()
-        addControlPanel()
-
-        if (!CalibrationStore.hasCalibration(this)) {
-            // First run: walk the user through tapping the 6 pockets before showing guides.
-            startCalibration()
-        }
-
-        mediaProjection?.let { projection ->
-            captureEngine = CaptureEngine(this, projection) { bitmap ->
-                processFrame(bitmap)
+        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        addOverlay()
+        addPanel()
+        if (!CalibrationStore.hasCalibration(this)) startCalibration()
+        try {
+            projection?.let { mp ->
+                engine = CaptureEngine(this, mp) { bmp -> processFrame(bmp) }
+                engine?.start()
             }
-            captureEngine?.start()
+        } catch (e: Exception) {
+            Log.e("PoolAimAssist", "Capture could not start", e)
+            overlay?.update(null, emptyList(), CalibrationStore.loadPockets(this), "Capture error: ${e.javaClass.simpleName}")
         }
-
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
-    private fun processFrame(bitmap: android.graphics.Bitmap) {
-        if (calibrating) {
-            if (!bitmap.isRecycled) bitmap.recycle()
-            return
-        }
-        val balls = detector.detectBalls(bitmap)
-        val cue = balls.firstOrNull { it.isCueBall }
-        val objectBalls = balls.filterNot { it.isCueBall }
-        val pockets = CalibrationStore.loadPockets(this)
+    @Suppress("DEPRECATION")
+    private fun windowType(): Int = if (Build.VERSION.SDK_INT >= 26)
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+    else WindowManager.LayoutParams.TYPE_PHONE
 
-        val guides = if (cue != null && pockets.isNotEmpty()) {
-            TrajectoryCalculator.computeShotGuides(cue, objectBalls, pockets)
-        } else emptyList()
-
-        overlayView?.setPockets(pockets)
-        overlayView?.update(cue, guides)
-
-        if (!bitmap.isRecycled) bitmap.recycle()
-    }
-
-    private fun addOverlayWindow() {
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val view = OverlayView(this)
-        overlayView = view
-
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+    private fun addOverlay() {
+        val manager = wm ?: return
+        val p = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+            windowType(), WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
-        params.gravity = Gravity.TOP or Gravity.START
-
-        windowManager?.addView(view, params)
+        p.gravity = Gravity.TOP or Gravity.START
+        overlay = OverlayView(this).also { manager.addView(it, p) }
     }
-
-    private fun addControlPanel() {
-        val wm = windowManager ?: return
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+    private fun addPanel() {
+        val manager = wm ?: return
+        val p = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            windowType(), WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
-        params.gravity = Gravity.TOP or Gravity.START
-        params.x = 24
-        params.y = 120
-
-        val panel = ControlPanelView(
-            this, wm, params,
-            onCalibrate = { startCalibration() },
-            onStop = { stopSelf() }
-        )
-        controlPanel = panel
-        wm.addView(panel, params)
+        p.gravity = Gravity.TOP or Gravity.START
+        p.x = 16; p.y = 100
+        panel = ControlPanelView(this, manager, p, { startCalibration() }, { stopSelf() })
+        manager.addView(panel, p)
     }
-
     private fun startCalibration() {
         if (calibrating) return
+        val manager = wm ?: return
         calibrating = true
-        val wm = windowManager ?: return
-
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            overlayType,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        val p = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+            windowType(), WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
-        params.gravity = Gravity.TOP or Gravity.START
-
-        val calib = CalibrationOverlay(this) { pockets ->
-            CalibrationStore.savePockets(this, pockets)
-            stopCalibration()
+        p.gravity = Gravity.TOP or Gravity.START
+        calibration = CalibrationOverlay(this) { points ->
+            CalibrationStore.savePockets(this, points)
+            calibration?.let { runCatching { manager.removeView(it) } }
+            calibration = null
+            calibrating = false
         }
-        calibrationOverlay = calib
-        wm.addView(calib, params)
+        manager.addView(calibration, p)
     }
 
-    private fun stopCalibration() {
-        calibrating = false
-        calibrationOverlay?.let { windowManager?.removeView(it) }
-        calibrationOverlay = null
-        overlayView?.setPockets(CalibrationStore.loadPockets(this))
-    }
-
-    private fun buildNotification(): Notification {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "Pool Aim Assist", NotificationManager.IMPORTANCE_LOW
+    private fun processFrame(bitmap: Bitmap) {
+        try {
+            if (calibrating) return
+            frameCount++
+            val view = overlay ?: return
+            val vw = view.width.takeIf { it > 0 } ?: bitmap.width
+            val vh = view.height.takeIf { it > 0 } ?: bitmap.height
+            val sx = bitmap.width.toFloat() / vw
+            val sy = bitmap.height.toFloat() / vh
+            fun toCapture(p: Pt) = Pt(p.x * sx, p.y * sy)
+            fun toView(p: Pt) = Pt(p.x / sx, p.y / sy)
+            val viewPockets = CalibrationStore.loadPockets(this)
+            val capturePockets = viewPockets.map(::toCapture)
+            val balls = detector.detectBalls(bitmap, capturePockets)
+            val cue = balls.firstOrNull { it.isCueBall }
+            val objects = balls.filterNot { it.isCueBall }
+            val shots = if (cue != null && capturePockets.size == 6)
+                TrajectoryCalculator.computeShotGuides(cue, objects, capturePockets)
+                else emptyList()
+            fun mapBall(ball: Ball): Ball = ball.copy(
+                center = toView(ball.center),
+                radiusPx = ball.radiusPx / ((sx + sy) / 2f)
             )
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+            val mappedShots = shots.map { g ->
+                ShotGuide(mapBall(g.objectBall), toView(g.pocket), toView(g.ghostBallCenter), g.cutAngleDeg)
+            }
+            val diag = "F:$frameCount  Cue:${if (cue != null) "YES" else "NO"}  Balls:${objects.size}  Lines:${shots.size}"
+            view.update(cue?.let(::mapBall), mappedShots, viewPockets, diag)
+        } catch (e: Exception) {
+            Log.e("PoolAimAssist", "Detection failed", e)
+            overlay?.update(null, emptyList(), CalibrationStore.loadPockets(this), "Detection error: ${e.javaClass.simpleName}")
+        } finally {
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+    }
+
+    private fun notification(): Notification {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Pool Aim Assist", NotificationManager.IMPORTANCE_LOW))
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Pool Aim Assist is running")
-            .setContentText("Showing shot guides over the table")
+            .setContentText("Screen capture and shot guide")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setOngoing(true)
-            .build()
+            .setOngoing(true).build()
     }
-
     override fun onDestroy() {
+        engine?.stop()
+        calibration?.let { runCatching { wm?.removeView(it) } }
+        panel?.let { runCatching { wm?.removeView(it) } }
+        overlay?.let { runCatching { wm?.removeView(it) } }
+        projection?.stop()
         super.onDestroy()
-        captureEngine?.stop()
-        overlayView?.let { runCatching { windowManager?.removeView(it) } }
-        controlPanel?.let { runCatching { windowManager?.removeView(it) } }
-        calibrationOverlay?.let { runCatching { windowManager?.removeView(it) } }
-        mediaProjection?.stop()
     }
 }
