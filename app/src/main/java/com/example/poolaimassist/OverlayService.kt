@@ -49,7 +49,7 @@ class OverlayService : Service() {
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
         val resultData: Intent? = intent?.getParcelableExtra(EXTRA_RESULT_DATA)
 
-        if (resultCode == -1 || resultData == null) {
+        if (resultCode != android.app.Activity.RESULT_OK || resultData == null) {
             stopSelf()
             return START_NOT_STICKY
         }
